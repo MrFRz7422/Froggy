@@ -1,0 +1,1545 @@
+-- 🐸 Froggy.lol — V2 Mobile (Player LOS-off, NPC LOS-on, drag fixed)
+local P=game:GetService("Players")
+local U=game:GetService("UserInputService")
+local R=game:GetService("RunService")
+local RS=game:GetService("ReplicatedStorage")
+local H=game:GetService("HttpService")
+local LP=P.LocalPlayer
+local Cam=workspace.CurrentCamera
+local MX=1500
+local IS_MOBILE = U.TouchEnabled and not U.KeyboardEnabled
+local S={
+    aim=true,part="Head",fov=150,target=nil,mode="Player",
+    esp=false,names=false,tracers=false,
+    infJump=false,fly=false,flySpeed=60,noclip=false,
+    infDoubleJump=false,fireRate=false,fireRateValue=0.001,
+    walkSpeed=false,walkSpeedValue=16,
+    jumpBoost=false,jumpBoostValue=50
+}
+local FV,FG,FC=nil,nil,nil
+local KILLED=false
+local CONNS={}
+local function track(c) table.insert(CONNS,c) return c end
+
+local NPC_SCAN_INTERVAL = 0.12
+local NPC_MAX_CANDIDATES = 40
+
+local CD="Froggy_Config" local CF=CD.."/config.json"
+local function saveCfg()
+    if not writefile then return end
+    local c={}
+    for k,v in pairs(S) do if k~="target" then c[k]=v end end
+    pcall(makefolder,CD)
+    pcall(writefile,CF,H:JSONEncode(c))
+end
+local function loadCfg()
+    if not readfile or not isfile or not isfile(CF) then return false end
+    local ok,c=pcall(function() return H:JSONDecode(readfile(CF)) end)
+    if ok and type(c)=="table" then
+        for k,v in pairs(c) do if S[k]~=nil and k~="target" then S[k]=v end end
+        if S.part~="Head" and S.part~="Torso" then S.part="Head" end
+        S.fov=math.clamp(math.floor(tonumber(S.fov) or 150),10,MX)
+        return true
+    end
+    return false
+end
+loadCfg()
+
+local function gp(c,n)
+    if not c then return nil end
+    if n=="Head" then return c:FindFirstChild("Head") end
+    return c:FindFirstChild("UpperTorso") or c:FindFirstChild("Torso") or c:FindFirstChild("HumanoidRootPart")
+end
+local function gr() local c=LP.Character return c and c:FindFirstChild("HumanoidRootPart") end
+local function gH() local c=LP.Character return c and c:FindFirstChildOfClass("Humanoid") end
+
+-- HUMANOID HOOK
+local origIndex_h=nil local origNewIndex_h=nil
+local function installHumanoidHook()
+    if KILLED or not getrawmetatable or not hookmetamethod then return end
+    local hum=gH() if not hum then return end
+    local ok,mt=pcall(getrawmetatable,hum) if not ok or not mt then return end
+    if not origIndex_h then origIndex_h=rawget(mt,"__index") end
+    if not origNewIndex_h then origNewIndex_h=rawget(mt,"__newindex") end
+    local newIndex=newcclosure(function(self,idx)
+        if not KILLED and typeof(self)=="Instance" and self:IsA("Humanoid") then
+            if idx=="WalkSpeed" and S.walkSpeed then return S.walkSpeedValue end
+            if idx=="JumpPower" and S.jumpBoost then return S.jumpBoostValue end
+        end
+        return origIndex_h(self,idx)
+    end)
+    local newNewIndex=newcclosure(function(self,idx,val)
+        if not KILLED and typeof(self)=="Instance" and self:IsA("Humanoid") then
+            if idx=="WalkSpeed" and S.walkSpeed then return origNewIndex_h(self,idx,S.walkSpeedValue) end
+            if idx=="JumpPower" and S.jumpBoost then return origNewIndex_h(self,idx,S.jumpBoostValue) end
+        end
+        return origNewIndex_h(self,idx,val)
+    end)
+    pcall(function()
+        if setreadonly then setreadonly(mt,false) end
+        mt.__index=newIndex mt.__newindex=newNewIndex
+        if setreadonly then setreadonly(mt,true) end
+    end)
+end
+track(LP.CharacterAdded:Connect(function() task.wait(0.8) installHumanoidHook() end))
+task.spawn(function() task.wait(1) installHumanoidHook() end)
+
+-- SILENT AIM
+local rayParams=RaycastParams.new()
+rayParams.FilterType=Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater=true
+
+local function hasLOS(targetPos, targetModel)
+    rayParams.FilterDescendantsInstances={LP.Character,Cam}
+    local origin=Cam.CFrame.Position
+    local dir=targetPos-origin
+    if dir.Magnitude<1 then return false end
+    local hit=workspace:Raycast(origin,dir,rayParams)
+    if hit==nil then return true end
+    if targetModel and hit.Instance:IsDescendantOf(targetModel) then return true end
+    if hit.Instance.Transparency>0.9 then return true end
+    return false
+end
+
+local npcCache = {}
+local lastNPCCacheBuild = 0
+
+local function buildNPCCache()
+    local now = os.clock()
+    if now - lastNPCCacheBuild < NPC_SCAN_INTERVAL then return end
+    lastNPCCacheBuild = now
+    local newList = {}
+    local count = 0
+    for _,obj in ipairs(workspace:GetDescendants()) do
+        if count >= NPC_MAX_CANDIDATES then break end
+        if obj:IsA("Model") and obj ~= LP.Character then
+            local humanoid = obj:FindFirstChildOfClass("Humanoid")
+            if humanoid and humanoid.Health > 0 then
+                if not obj:FindFirstChild("PlayerGui") and not P:FindFirstChild(obj.Name) then
+                    count = count + 1
+                    newList[count] = obj
+                end
+            end
+        end
+    end
+    npcCache = newList
+end
+
+local function findTarget()
+    local center = Cam.ViewportSize / 2
+    local best, bestDist = nil, math.huge
+    local camPos = Cam.CFrame.Position
+    local fovRadius = S.fov
+
+    if S.mode == "Player" then
+        -- Player mode: NO LOS check. Players behind walls still get targeted.
+        for _,p in ipairs(P:GetPlayers()) do
+            if p ~= LP then
+                local char = p.Character
+                if char then
+                    local h = char:FindFirstChildOfClass("Humanoid")
+                    local b = gp(char, S.part)
+                    if h and b and h.Health > 0 then
+                        if not (p.Team and LP.Team and p.Team == LP.Team) then
+                            local worldDist = (b.Position - camPos).Magnitude
+                            if worldDist <= 1000 then
+                                local sp, on = Cam:WorldToViewportPoint(b.Position)
+                                if on then
+                                    local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                                    if d <= fovRadius and d < bestDist then
+                                        bestDist = d
+                                        best = { position = b.Position, part = b, model = char }
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    else
+        -- NPC mode: LOS required. Walls block NPC targeting.
+        buildNPCCache()
+        for i = 1, #npcCache do
+            local m = npcCache[i]
+            if m.Parent then
+                local b = gp(m, S.part)
+                if b then
+                    local worldDist = (b.Position - camPos).Magnitude
+                    if worldDist <= 1000 then
+                        local sp, on = Cam:WorldToViewportPoint(b.Position)
+                        if on then
+                            local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                            if d <= fovRadius and d < bestDist then
+                                if hasLOS(b.Position, m) then
+                                    bestDist = d
+                                    best = { position = b.Position, part = b, model = m }
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local origIndex_cam = nil
+local function installCamHook()
+    if origIndex_cam or KILLED or not hookmetamethod then return end
+    local isCaller = checkcaller or function() return false end
+    origIndex_cam = hookmetamethod(game, "__index", newcclosure(function(self, idx)
+        if KILLED then return origIndex_cam(self, idx) end
+        if self == Cam and idx == "ViewportSize" and S.aim and not isCaller() and S.target then
+            local sp, on = Cam:WorldToViewportPoint(S.target)
+            if on then return Vector2.new(sp.X * 2, sp.Y * 2) end
+        end
+        return origIndex_cam(self, idx)
+    end))
+end
+installCamHook()
+
+-- FOV RING
+local fovGui=nil local fovRing=nil
+local function buildFovRing()
+    if fovGui or KILLED then return end
+    local parent=nil
+    if gethui then local ok,h=pcall(gethui) if ok and h then parent=h end end
+    if not parent then parent=LP:FindFirstChild("PlayerGui") or LP:WaitForChild("PlayerGui",5) end
+    if not parent then return end
+    local sg=Instance.new("ScreenGui") sg.Name="FroggyFOV" sg.ResetOnSpawn=false sg.IgnoreGuiInset=true sg.DisplayOrder=2147483646 sg.Parent=parent
+    local ring=Instance.new("Frame") ring.Name="Ring" ring.BackgroundTransparency=1 ring.AnchorPoint=Vector2.new(0.5,0.5) ring.Position=UDim2.new(0.5,0,0.5,0) ring.Size=UDim2.new(0,S.fov*2,0,S.fov*2) ring.ZIndex=2147483647 ring.Parent=sg
+    Instance.new("UICorner",ring).CornerRadius=UDim.new(1,0)
+    local stroke=Instance.new("UIStroke") stroke.Color=Color3.fromRGB(50,200,100) stroke.Thickness=1.5 stroke.Transparency=0.3 stroke.ApplyStrokeMode=Enum.ApplyStrokeMode.Border stroke.Parent=ring
+    fovGui=sg fovRing=ring
+end
+buildFovRing()
+track(R.RenderStepped:Connect(function()
+    if KILLED then return end
+    if not fovGui or not fovGui.Parent then fovGui=nil fovRing=nil buildFovRing() if not fovRing then return end end
+    local vp=Cam.ViewportSize
+    if not vp or vp.X<=0 or vp.Y<=0 then fovRing.Visible=false return end
+    fovRing.Size=UDim2.new(0,S.fov*2,0,S.fov*2)
+    fovRing.Position=UDim2.new(0.5,0,0.5,0)
+    fovRing.Visible=true
+end))
+
+-- MOVEMENT
+track(U.JumpRequest:Connect(function()
+    if KILLED or not S.infJump then return end
+    local h=gH()
+    if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
+end))
+track(R.Heartbeat:Connect(function()
+    if KILLED then return end
+    local h=gH() if not h then return end
+    if S.walkSpeed and math.abs(h.WalkSpeed-S.walkSpeedValue)>0.5 then pcall(function() h.WalkSpeed=S.walkSpeedValue end) end
+    if S.jumpBoost and math.abs(h.JumpPower-S.jumpBoostValue)>0.5 then pcall(function() h.JumpPower=S.jumpBoostValue end) end
+    if S.noclip then
+        local c=LP.Character
+        if c then
+            for _,p in ipairs(c:GetDescendants()) do
+                if p:IsA("BasePart") and p.CanCollide then p.CanCollide=false end
+            end
+        end
+    end
+end))
+
+-- FIRE RATE
+local FR_GunExceptions={["Sniper"]=true,["Crossbow"]=true,["Bow"]=true,["RPG"]=true}
+local FR_Items=nil
+pcall(function() FR_Items=require(RS.Modules.ItemLibrary).Items end)
+local FR_Orig={} local FR_Loop=nil local FR_Gen=0
+local function frBoostPass()
+    if KILLED or not FR_Items then return end
+    for name,data in pairs(FR_Items) do if type(data)=="table" then
+        if not FR_Orig[data] then
+            local sn={}
+            for _,p in ipairs({"ShootSpread","ShootAccuracy","ShootRecoil","ShootCooldown","ShootBurstCooldown","AttackCooldown","SwingCooldown","MeleeCooldown","Cooldown","RecoveryTime","ResetTime"}) do sn[p]=rawget(data,p) end
+            FR_Orig[data]=sn
+        end
+        if not FR_GunExceptions[name] then
+            if data.ShootSpread~=nil then rawset(data,"ShootSpread",0) end
+            if data.ShootAccuracy~=nil then rawset(data,"ShootAccuracy",0) end
+            if data.ShootRecoil~=nil then rawset(data,"ShootRecoil",0) end
+            if data.ShootCooldown~=nil then rawset(data,"ShootCooldown",S.fireRateValue) end
+            if data.ShootBurstCooldown~=nil then rawset(data,"ShootBurstCooldown",S.fireRateValue) end
+        end
+        if data.AttackCooldown~=nil then rawset(data,"AttackCooldown",S.fireRateValue) end
+        if data.SwingCooldown~=nil then rawset(data,"SwingCooldown",S.fireRateValue) end
+        if data.MeleeCooldown~=nil then rawset(data,"MeleeCooldown",S.fireRateValue) end
+        if data.Cooldown~=nil then rawset(data,"Cooldown",S.fireRateValue) end
+        if data.RecoveryTime~=nil then rawset(data,"RecoveryTime",S.fireRateValue) end
+        if data.ResetTime~=nil then rawset(data,"ResetTime",S.fireRateValue) end
+    end end
+end
+local function frRestorePass()
+    if not FR_Items then return end
+    for item,sn in pairs(FR_Orig) do
+        for p,v in pairs(sn) do
+            if rawget(item,p)~=v then rawset(item,p,v) end
+        end
+    end
+end
+local function startFR()
+    if not FR_Items or KILLED then S.fireRate=false return end
+    FR_Gen=FR_Gen+1 local g=FR_Gen
+    pcall(frBoostPass)
+    if FR_Loop then pcall(task.cancel,FR_Loop) FR_Loop=nil end
+    FR_Loop=task.spawn(function()
+        while S.fireRate and FR_Gen==g and not KILLED do
+            pcall(frBoostPass)
+            task.wait(0.25)
+        end
+    end)
+end
+local function stopFR()
+    S.fireRate=false FR_Gen=FR_Gen+1
+    if FR_Loop then pcall(task.cancel,FR_Loop) FR_Loop=nil end
+    pcall(frRestorePass) FR_Orig={}
+end
+
+-- INF DOUBLE JUMP
+local MAX_DJ=676767
+local FC_Module,CurFighter,ItemConn
+local OrigVals={} local DJLoop=nil local DJGen=0
+local function getCtrl()
+    if FC_Module then return FC_Module end
+    local ps=LP:FindFirstChild("PlayerScripts")
+    local ctr=ps and ps:FindFirstChild("Controllers")
+    local m=ctr and ctr:FindFirstChild("FighterController")
+    if not m then return nil end
+    local ok,r=pcall(require,m)
+    if ok and type(r)=="table" then FC_Module=r return r end
+    return nil
+end
+local function getFighter()
+    local c=getCtrl() if not c then return nil end
+    if c.LocalFighter then return c.LocalFighter end
+    if type(c.GetFighter)~="function" then return nil end
+    local f=c:GetFighter(LP) if f then return f end
+    if LP.Character then f=c:GetFighter(LP.Character) if f then return f end end
+    return nil
+end
+local function rememberOrig(item)
+    if type(item)~="table" or type(item.Info)~="table" then return end
+    if OrigVals[item]==nil then OrigVals[item]=rawget(item.Info,"MaxDoubleJumps") end
+end
+local function boostItem(item)
+    if type(item)~="table" or type(item.Info)~="table" then return end
+    rememberOrig(item)
+    if rawget(item.Info,"MaxDoubleJumps")~=MAX_DJ then rawset(item.Info,"MaxDoubleJumps",MAX_DJ) end
+end
+local function restoreItem(item)
+    if type(item)~="table" or type(item.Info)~="table" then return end
+    local orig=OrigVals[item]
+    if orig==nil then
+        if rawget(item.Info,"MaxDoubleJumps")~=nil then rawset(item.Info,"MaxDoubleJumps",nil) end
+    else
+        if rawget(item.Info,"MaxDoubleJumps")~=orig then rawset(item.Info,"MaxDoubleJumps",orig) end
+    end
+end
+local function startDJ()
+    if KILLED then return end
+    DJGen=DJGen+1 local myGen=DJGen
+    if DJLoop then pcall(task.cancel,DJLoop) DJLoop=nil end
+    DJLoop=task.spawn(function()
+        while S.infDoubleJump and DJGen==myGen and not KILLED do
+            pcall(function()
+                local f=getFighter()
+                if f then
+                    if f~=CurFighter then
+                        if ItemConn then pcall(function() ItemConn:Disconnect() end) ItemConn=nil end
+                        CurFighter=f
+                        if f.ItemAdded and type(f.ItemAdded.Connect)=="function" then
+                            ItemConn=f.ItemAdded:Connect(function(item) if S.infDoubleJump then boostItem(item) end end)
+                        end
+                    end
+                    if type(f.Items)=="table" then
+                        for _,item in pairs(f.Items) do boostItem(item) end
+                    end
+                end
+            end)
+            task.wait(0.25)
+        end
+    end)
+end
+local function stopDJ()
+    S.infDoubleJump=false DJGen=DJGen+1
+    if DJLoop then pcall(task.cancel,DJLoop) DJLoop=nil end
+    if ItemConn then pcall(function() ItemConn:Disconnect() end) ItemConn=nil end
+    for item in pairs(OrigVals) do pcall(restoreItem,item) end
+    OrigVals={} CurFighter=nil
+end
+
+-- FLY
+local savedHS=16 local savedJP=50 local flyConn
+local function startFly()
+    if S.fly or KILLED then return end
+    local h,r=gH(),gr() if not h or not r then return end
+    S.fly=true savedHS=h.WalkSpeed savedJP=h.JumpPower
+    h.PlatformStand=false h.AutoRotate=false
+    FV=Instance.new("BodyVelocity") FV.MaxForce=Vector3.new(1e7,1e7,1e7) FV.Velocity=Vector3.zero FV.Parent=r
+    FG=Instance.new("BodyGyro") FG.MaxTorque=Vector3.new(1e7,1e7,1e7) FG.CFrame=r.CFrame FG.Parent=r
+    FC=0
+    flyConn=R.Heartbeat:Connect(function(dt)
+        if not S.fly or not FV or not FG or KILLED then return end
+        FC+=dt
+        if FC<0.033 then return end
+        FC=0
+        local d=Vector3.zero
+        if U:IsKeyDown(Enum.KeyCode.W) then d+=Cam.CFrame.LookVector end
+        if U:IsKeyDown(Enum.KeyCode.S) then d-=Cam.CFrame.LookVector end
+        if U:IsKeyDown(Enum.KeyCode.A) then d-=Cam.CFrame.RightVector end
+        if U:IsKeyDown(Enum.KeyCode.D) then d+=Cam.CFrame.RightVector end
+        if U:IsKeyDown(Enum.KeyCode.Space) then d+=Vector3.yAxis end
+        if d.Magnitude>0 then d=d.Unit end
+        FV.Velocity=d*S.flySpeed
+        FG.CFrame=Cam.CFrame
+    end)
+    track(flyConn)
+end
+local function stopFly()
+    if not S.fly then return end
+    S.fly=false
+    if flyConn then flyConn:Disconnect() flyConn=nil end
+    if FV then FV:Destroy() FV=nil end
+    if FG then FG:Destroy() FG=nil end
+    local h=gH()
+    if h then
+        h.PlatformStand=false h.AutoRotate=true
+        h.WalkSpeed=S.walkSpeed and S.walkSpeedValue or savedHS
+        h.JumpPower=S.jumpBoost and S.jumpBoostValue or savedJP
+    end
+end
+
+-- ESP / NAMES / TRACERS
+local espC={} local nameC={}
+local function espApply(p)
+    if p==LP then return end
+    local function hk(c)
+        if not c or c:FindFirstChild("FroggyESP") then return end
+        local h=Instance.new("Highlight")
+        h.Name="FroggyESP" h.Adornee=c
+        h.FillColor=Color3.fromRGB(255,0,0) h.FillTransparency=0.5
+        h.OutlineColor=Color3.new(1,1,1)
+        h.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
+        h.Parent=c
+    end
+    if p.Character then hk(p.Character) end
+    table.insert(espC,p.CharacterAdded:Connect(function(c)
+        task.wait(0.5)
+        if S.esp and not KILLED then hk(c) end
+    end))
+end
+local function eon()
+    if KILLED then return end
+    S.esp=true
+    for _,p in ipairs(P:GetPlayers()) do espApply(p) end
+end
+local function eoff()
+    S.esp=false
+    for _,c in ipairs(espC) do c:Disconnect() end
+    espC={}
+    for _,p in ipairs(P:GetPlayers()) do
+        if p.Character then
+            local h=p.Character:FindFirstChild("FroggyESP")
+            if h then h:Destroy() end
+        end
+    end
+end
+track(P.PlayerAdded:Connect(function(p) if S.esp and not KILLED then espApply(p) end end))
+
+local function nameApply(p)
+    if p==LP then return end
+    local function hk(c)
+        if not c or c:FindFirstChild("FroggyName") then return end
+        local hd=c:FindFirstChild("Head") if not hd then return end
+        local bg=Instance.new("BillboardGui")
+        bg.Name="FroggyName" bg.Size=UDim2.new(0,220,0,60)
+        bg.StudsOffset=Vector3.new(0,2.8,0) bg.AlwaysOnTop=true
+        bg.Adornee=hd bg.Parent=hd
+        local d=Instance.new("TextLabel")
+        d.Size=UDim2.new(1,0,0,32) d.BackgroundTransparency=1
+        d.Text=p.DisplayName d.TextColor3=Color3.new(1,1,1)
+        d.TextScaled=true d.Font=Enum.Font.GothamBold d.Parent=bg
+        local u=Instance.new("TextLabel")
+        u.Size=UDim2.new(1,0,0,24) u.Position=UDim2.new(0,0,0,34)
+        u.BackgroundTransparency=1 u.Text="(@"..p.Name..")"
+        u.TextColor3=Color3.fromRGB(200,220,255) u.TextScaled=true
+        u.Font=Enum.Font.Gotham u.Parent=bg
+    end
+    if p.Character then hk(p.Character) end
+    table.insert(nameC,p.CharacterAdded:Connect(function(c)
+        task.wait(0.5)
+        if S.names and not KILLED then hk(c) end
+    end))
+end
+local function non()
+    if KILLED then return end
+    S.names=true
+    for _,p in ipairs(P:GetPlayers()) do nameApply(p) end
+end
+local function noff()
+    S.names=false
+    for _,c in ipairs(nameC) do c:Disconnect() end
+    nameC={}
+    for _,p in ipairs(P:GetPlayers()) do
+        if p.Character then
+            for _,d in ipairs(p.Character:GetDescendants()) do
+                if d.Name=="FroggyName" then d:Destroy() end
+            end
+        end
+    end
+end
+track(P.PlayerAdded:Connect(function(p) if S.names and not KILLED then nameApply(p) end end))
+
+local lines={}
+local tracerClock=0
+local function tracerTick()
+    if KILLED or not S.tracers then
+        for _,l in pairs(lines) do l.Visible=false end
+        return
+    end
+    local rt=gr() if not rt then for _,l in pairs(lines) do l.Visible=false end return end
+    local mp,mo=Cam:WorldToViewportPoint(rt.Position+Vector3.new(0,2,0))
+    local o=mo and Vector2.new(mp.X,mp.Y) or Vector2.new(Cam.ViewportSize.X/2,Cam.ViewportSize.Y)
+    for _,p in ipairs(P:GetPlayers()) do
+        if p~=LP and p.Character then
+            local pt=p.Character:FindFirstChild("Head") or p.Character:FindFirstChild("HumanoidRootPart")
+            local h=p.Character:FindFirstChildOfClass("Humanoid")
+            if pt and h and h.Health>0 then
+                if not lines[p] then
+                    lines[p]=Drawing.new("Line")
+                    lines[p].Thickness=1.5
+                    lines[p].Color=Color3.fromRGB(255,50,50)
+                    lines[p].Transparency=0.8
+                end
+                local sp,on=Cam:WorldToViewportPoint(pt.Position)
+                if on then
+                    lines[p].From=o lines[p].To=Vector2.new(sp.X,sp.Y) lines[p].Visible=true
+                else
+                    lines[p].Visible=false
+                end
+            elseif lines[p] then
+                lines[p].Visible=false
+            end
+        end
+    end
+end
+track(R.Heartbeat:Connect(function(dt)
+    if KILLED or not S.tracers then return end
+    tracerClock+=dt
+    if tracerClock<0.05 then return end
+    tracerClock=0
+    tracerTick()
+end))
+track(P.PlayerRemoving:Connect(function(p)
+    if lines[p] then lines[p]:Remove() lines[p]=nil end
+end))
+
+-- SKIN CHANGER
+local sd=false
+local function loadSkins()
+    if sd or KILLED then return "already" end
+    sd=true
+    local ctr=LP.PlayerScripts.Controllers
+    local EL,CL,IL,DC
+    pcall(function() EL=require(RS.Modules:WaitForChild("EnumLibrary",10)) if EL then EL:WaitForEnumBuilder() end end)
+    pcall(function() CL=require(RS.Modules:WaitForChild("CosmeticLibrary",10)) end)
+    pcall(function() IL=require(RS.Modules:WaitForChild("ItemLibrary",10)) end)
+    pcall(function() DC=require(ctr:WaitForChild("PlayerDataController",10)) end)
+    if not(CL and DC) then return "no libs" end
+    local eq,fav={},{} local file="Rivals-Skinchanger/skins.txt"
+    local cw,vp=nil,nil
+    local function clone(n,t)
+        local b=CL.Cosmetics[n] if not b then return nil end
+        local d=table.clone(b)
+        d.Name,d.Type,d.Seed=n,d.Type or t,math.random(1,1e5)
+        if EL then
+            local s,id=pcall(EL.ToEnum,EL,n)
+            if s and id then d.Enum,d.ObjectID=id,id end
+        end
+        return d
+    end
+    local function save()
+        if not writefile then return end
+        task.spawn(function()
+            local cfg={equipped={},favorites=fav}
+            for w,c in pairs(eq) do
+                cfg.equipped[w]={}
+                for t,d in pairs(c) do
+                    if d and d.Name then cfg.equipped[w][t]={name=d.Name,seed=d.Seed} end
+                end
+            end
+            pcall(makefolder,"Rivals-Skinchanger")
+            pcall(writefile,file,H:JSONEncode(cfg))
+        end)
+    end
+    local function fr()
+        pcall(function()
+            if DC and DC.CurrentData and DC.CurrentData.Replicate then
+                DC.CurrentData:Replicate("WeaponInventory")
+                DC.CurrentData:Replicate("CosmeticInventory")
+            end
+        end)
+    end
+    task.spawn(function()
+        if not readfile or not isfile or not isfile(file) then return end
+        local s,cfg=pcall(H.JSONDecode,H,readfile(file))
+        if s and cfg and cfg.equipped then
+            for w,c in pairs(cfg.equipped) do
+                eq[w]={}
+                for t,d in pairs(c) do
+                    local x=clone(d.name,t)
+                    if x then eq[w][t]=x end
+                end
+            end
+            fav=cfg.favorites or {}
+            fr()
+        end
+    end)
+    CL.OwnsCosmetic=function(self,inv,n,w)
+        if n and (string.find(n,"MISSING_") or CL.Cosmetics[n]) then return true end
+        return false
+    end
+    local oG=DC.Get
+    DC.Get=function(self,k)
+        if k=="CosmeticInventory" then
+            return setmetatable({},{__index=function(_,k2) return CL.Cosmetics[k2] and true or nil end})
+        end
+        if k=="FavoritedCosmetics" then
+            local r=oG(self,k) or {}
+            for w,f in pairs(fav) do
+                r[w]=r[w] or {}
+                for n,isF in pairs(f) do
+                    if CL.Cosmetics[n] then r[w][n]=isF end
+                end
+            end
+            return r
+        end
+        return oG(self,k)
+    end
+    local oW=DC.GetWeaponData
+    DC.GetWeaponData=function(self,wn)
+        local d=oW(self,wn)
+        if not d then return nil end
+        if eq[wn] then
+            for t,cd in pairs(eq[wn]) do
+                if t~="Dances" then d[t]=cd end
+            end
+        end
+        return d
+    end
+    if hookmetamethod then
+        local rm=RS:FindFirstChild("Remotes")
+        local dr=rm and rm:FindFirstChild("Data")
+        local er=dr and dr:FindFirstChild("EquipCosmetic")
+        if er then
+            local oNc
+            oNc=hookmetamethod(game,"__namecall",function(self,...)
+                local a={...}
+                if self==er and getnamecallmethod()=="FireServer" then
+                    local wn,ct,cn=a[1],a[2],a[3]
+                    eq[wn]=eq[wn] or {}
+                    if not cn or cn=="" or cn=="None" then eq[wn][ct]=nil
+                    else eq[wn][ct]=clone(cn,ct) end
+                    task.defer(function() fr() save() end)
+                    return
+                end
+                return oNc(self,...)
+            end)
+        end
+    end
+    pcall(function()
+        local CIM=LP.PlayerScripts.Modules.ClientReplicatedClasses.ClientFighter.ClientItem
+        local CI=require(CIM)
+        local oNI=CI.new
+        CI.new=function(rd,cf)
+            local r=oNI(rd,cf)
+            if r and cf and cf.Player==LP then
+                local wn=r.Name
+                if eq[wn] then
+                    for ctv,cd in pairs(eq[wn]) do r[ctv]=cd end
+                end
+            end
+            return r
+        end
+        local oCVM=CI._CreateViewModel
+        CI._CreateViewModel=function(self,vr)
+            local wn=self.Name
+            local wp=self.ClientFighter and self.ClientFighter.Player
+            cw=(wp==LP) and wn or nil
+            if wp==LP and eq[wn] and vr then
+                local dk,sk,ck,wk,nk=self:ToEnum("Data"),self:ToEnum("Skin"),self:ToEnum("Charm"),self:ToEnum("Wrap"),self:ToEnum("Name")
+                local d=vr[dk] or vr.Data
+                if d then
+                    if eq[wn].Skin then d[sk or "Skin"]=eq[wn].Skin end
+                    if eq[wn].Charm then d[ck or "Charm"]=eq[wn].Charm end
+                    if eq[wn].Wrap then d[wk or "Wrap"]=eq[wn].Wrap end
+                    if eq[wn].Skin then d[nk or "Name"]=eq[wn].Skin.Name end
+                end
+            end
+            local r=oCVM(self,vr)
+            cw=nil
+            return r
+        end
+        local vmm=CIM:FindFirstChild("ClientViewModel")
+        if vmm then
+            local CVM=require(vmm)
+            local oNM=CVM.new
+            CVM.new=function(rd,ci)
+                local wp=ci.ClientFighter and ci.ClientFighter.Player
+                local wn=cw or ci.Name
+                if wp==LP and eq[wn] then
+                    local RC=require(RS.Modules.ReplicatedClass)
+                    local dk=RC:ToEnum("Data")
+                    rd[dk]=rd[dk] or {}
+                    local cs=eq[wn]
+                    if cs.Skin then rd[dk][RC:ToEnum("Skin")]=cs.Skin end
+                    if cs.Charm then rd[dk][RC:ToEnum("Charm")]=cs.Charm end
+                    if cs.Wrap then rd[dk][RC:ToEnum("Wrap")]=cs.Wrap end
+                end
+                local r=oNM(rd,ci)
+                if wp==LP and eq[wn] and eq[wn].Wrap and r._UpdateWrap then
+                    r:_UpdateWrap()
+                end
+                return r
+            end
+        end
+        local oImage=IL.GetViewModelImageFromWeaponData
+        IL.GetViewModelImageFromWeaponData=function(self,wd,hr)
+            if not wd then return oImage(self,wd,hr) end
+            local wn=wd.Name
+            local show=(wd.Skin and eq[wn] and wd.Skin==eq[wn].Skin) or (vp==LP and eq[wn] and eq[wn].Skin)
+            if show and eq[wn] and eq[wn].Skin then
+                local si=self.ViewModels[eq[wn].Skin.Name]
+                if si then return si[hr and "ImageHighResolution" or "Image"] or si.Image end
+            end
+            return oImage(self,wd,hr)
+        end
+    end)
+    pcall(function()
+        local EC=require(ctr:WaitForChild("EmoteController",10))
+        local oGE=EC.GetEmotes
+        EC.GetEmotes=function(self)
+            local em=oGE(self) or {}
+            for n,c in pairs(CL.Cosmetics) do
+                if c and (c.Type=="Dance" or c.Type=="Emote") and not em[n] then
+                    em[n]={Name=n,Type=c.Type,ObjectID=c.ObjectID,Enum=c.Enum}
+                end
+            end
+            return em
+        end
+    end)
+    LP.CharacterAdded:Connect(function() task.wait(1.2) fr() end)
+    if LP.Character then task.spawn(fr) end
+    print("Froggy.lol Skins Hook Injection Successful!")
+    return "loaded"
+end
+
+-- INTRO
+local oldGui=LP.PlayerGui:FindFirstChild("FroggyGUI") if oldGui then oldGui:Destroy() end
+local oldIntro=LP.PlayerGui:FindFirstChild("FroggyIntro") if oldIntro then oldIntro:Destroy() end
+local introParent=nil
+if gethui then local ok,res=pcall(gethui) if ok and res then introParent=res end end
+if not introParent then introParent=LP:WaitForChild("PlayerGui") end
+local introGui=Instance.new("ScreenGui")
+introGui.Name="FroggyIntro"
+introGui.ResetOnSpawn=false
+introGui.IgnoreGuiInset=true
+introGui.DisplayOrder=10
+introGui.Parent=introParent
+local bg=Instance.new("Frame")
+bg.Size=UDim2.fromScale(1,1)
+bg.BackgroundColor3=Color3.fromRGB(0,40,15)
+bg.BackgroundTransparency=0.35
+bg.BorderSizePixel=0
+bg.Parent=introGui
+local title=Instance.new("TextLabel")
+title.Size=UDim2.new(1,0,0,90)
+title.Position=UDim2.new(0,0,0.5,-90)
+title.BackgroundTransparency=1
+title.Text="Froggy.lol"
+title.TextColor3=Color3.fromRGB(140,255,170)
+title.TextStrokeColor3=Color3.fromRGB(0,80,20)
+title.Font=Enum.Font.GothamBlack
+title.TextSize=IS_MOBILE and 36 or 52
+title.TextTransparency=1
+title.Parent=introGui
+local loading=Instance.new("TextLabel")
+loading.Size=UDim2.new(1,0,0,40)
+loading.Position=UDim2.new(0,0,0.5,10)
+loading.BackgroundTransparency=1
+loading.Text="Loading..."
+loading.TextColor3=Color3.fromRGB(200,255,220)
+loading.Font=Enum.Font.GothamBold
+loading.TextSize=IS_MOBILE and 16 or 20
+loading.TextTransparency=1
+loading.Parent=introGui
+local INTRO_DURATION=4
+task.spawn(function()
+    local t0=tick()
+    while tick()-t0<0.6 do
+        local a=(tick()-t0)/0.6
+        if title.Parent then title.TextTransparency=1-a end
+        if loading.Parent then loading.TextTransparency=1-a end
+        task.wait(0.02)
+    end
+    task.wait(INTRO_DURATION)
+    local t1=tick()
+    while tick()-t1<0.5 do
+        local a=(tick()-t1)/0.5
+        if title.Parent then title.TextTransparency=a end
+        if loading.Parent then loading.TextTransparency=a end
+        if bg.Parent then bg.BackgroundTransparency=0.35+0.65*a end
+        task.wait(0.02)
+    end
+    pcall(function() introGui:Destroy() end)
+end)
+
+-- MAIN GUI
+local PANEL_W        = IS_MOBILE and 200 or 240
+local PANEL_H        = IS_MOBILE and 370 or 460
+local TITLE_H        = IS_MOBILE and 26  or 30
+local TAB_H          = IS_MOBILE and 24  or 28
+local TAB_BTN_W      = IS_MOBILE and 36  or 44
+local TAB_TEXT       = IS_MOBILE and 12  or 14
+local TOGGLE_H       = IS_MOBILE and 24  or 28
+local BTN_TEXT       = IS_MOBILE and 10  or 11
+local HEADER_H       = IS_MOBILE and 16  or 20
+local HEADER_TEXT    = IS_MOBILE and 10  or 11
+local SLIDER_BOX_H   = IS_MOBILE and 36  or 44
+local SLIDER_INPUT_H = IS_MOBILE and 13  or 16
+local SLIDER_LBL     = IS_MOBILE and 9   or 10
+local SLIDER_THICK   = IS_MOBILE and 4   or 5
+local SLIDER_Y       = IS_MOBILE and 22  or 26
+local ROW_H          = IS_MOBILE and 20  or 24
+local TARGET_H       = IS_MOBILE and 14  or 18
+local CIRCLE_SIZE    = IS_MOBILE and 44  or 46
+local CIRCLE_TEXT    = IS_MOBILE and 20  or 22
+local CLOSE_SIZE     = IS_MOBILE and 20  or 24
+local CLOSE_TEXT     = IS_MOBILE and 12  or 14
+local TITLE_TEXT     = IS_MOBILE and 12  or 13
+local GAP            = IS_MOBILE and 4   or 5
+
+local uiParent = IS_MOBILE and LP:WaitForChild("PlayerGui") or introParent
+
+local gui=Instance.new("ScreenGui")
+gui.Name="FroggyGUI"
+gui.ResetOnSpawn=false
+gui.IgnoreGuiInset=false
+gui.DisplayOrder=1000000
+gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+gui.Enabled=true
+gui.Parent=uiParent
+pcall(function() if protectgui then protectgui(gui) end end)
+pcall(function() if protect_gui then protect_gui(gui) end end)
+task.spawn(function()
+    while gui.Parent and not KILLED do
+        if IS_MOBILE and gui.Parent ~= LP.PlayerGui then gui.Parent=LP.PlayerGui end
+        if gui.DisplayOrder ~= 1000000 then gui.DisplayOrder=1000000 end
+        task.wait(1)
+    end
+end)
+
+local circleBtn=Instance.new("TextButton")
+circleBtn.Name="FroggyCircle"
+circleBtn.Size=UDim2.fromOffset(CIRCLE_SIZE,CIRCLE_SIZE)
+circleBtn.AnchorPoint=Vector2.new(0,1)
+circleBtn.Position=UDim2.new(0,16,1,-24)
+circleBtn.BackgroundColor3=Color3.fromRGB(20,20,30)
+circleBtn.BorderSizePixel=0
+circleBtn.Text="🌑"
+circleBtn.TextColor3=Color3.fromRGB(200,255,220)
+circleBtn.Font=Enum.Font.GothamBlack
+circleBtn.TextSize=CIRCLE_TEXT
+circleBtn.ZIndex=2147483647
+circleBtn.Active=true
+circleBtn.Visible=true
+circleBtn.Parent=gui
+Instance.new("UICorner",circleBtn).CornerRadius=UDim.new(1,0)
+Instance.new("UIStroke",circleBtn).Color=Color3.fromRGB(50,200,100)
+
+local mf=Instance.new("Frame")
+mf.Name="FroggyPanel"
+mf.Size=UDim2.fromOffset(PANEL_W,PANEL_H)
+mf.AnchorPoint=Vector2.new(0.5,0.5)
+mf.Position=UDim2.new(0.5,0,0.5,0)
+mf.BackgroundColor3=Color3.fromRGB(15,15,22)
+mf.BorderSizePixel=0
+mf.Visible=false
+mf.ZIndex=2147483647
+mf.Active=true
+mf.Parent=gui
+Instance.new("UICorner",mf).CornerRadius=UDim.new(0,10)
+local sk=Instance.new("UIStroke",mf)
+sk.Color=Color3.fromRGB(50,200,100)
+sk.Thickness=1.5
+
+-- DRAG SYSTEM — works on ANY descendant of mf except interactive controls
+local dragging=false
+local dragInput=nil
+local dragStart=nil
+local dragStartPos=nil
+
+local function tryStartDrag(i)
+    if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+        dragging=true
+        dragInput=i
+        dragStart=i.Position
+        dragStartPos=mf.Position
+    end
+end
+
+-- Attach drag start to every non-interactive descendant
+local function attachDrag(obj)
+    if obj:IsA("TextButton") or obj:IsA("ImageButton") or obj:IsA("TextBox") then
+        -- Buttons/textboxes: still start drag, but let their click handlers fire
+        obj.InputBegan:Connect(tryStartDrag)
+        return
+    end
+    if obj:IsA("Frame") or obj:IsA("TextLabel") or obj:IsA("ImageLabel") or obj:IsA("CanvasGroup") or obj:IsA("ScrollingFrame") then
+        obj.InputBegan:Connect(tryStartDrag)
+    end
+end
+
+attachDrag(mf)
+
+U.InputChanged:Connect(function(i)
+    if not dragging or i~=dragInput then return end
+    if i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch then
+        local d=i.Position-dragStart
+        mf.Position=UDim2.new(dragStartPos.X.Scale,dragStartPos.X.Offset+d.X,dragStartPos.Y.Scale,dragStartPos.Y.Offset+d.Y)
+    end
+end)
+U.InputEnded:Connect(function(i)
+    if i==dragInput then dragging=false dragInput=nil end
+end)
+
+local function clampPanel()
+    local vp = Cam.ViewportSize
+    local abs = mf.AbsoluteSize
+    if abs.X <= 0 or abs.Y <= 0 then return end
+    local sx, sy = mf.Position.X.Scale, mf.Position.Y.Scale
+    local ox, oy = mf.Position.X.Offset, mf.Position.Y.Offset
+    local px = sx * vp.X + ox - abs.X * 0.5
+    local py = sy * vp.Y + oy - abs.Y * 0.5
+    px = math.clamp(px, 0, math.max(0, vp.X - abs.X))
+    py = math.clamp(py, 0, math.max(0, vp.Y - abs.Y))
+    mf.Position = UDim2.fromOffset(px + abs.X * 0.5, py + abs.Y * 0.5)
+end
+
+local titleBar=Instance.new("Frame")
+titleBar.Size=UDim2.new(1,0,0,TITLE_H)
+titleBar.BackgroundColor3=Color3.fromRGB(15,40,25)
+titleBar.BorderSizePixel=0
+titleBar.ZIndex=2147483647
+titleBar.Active=true
+titleBar.Parent=mf
+Instance.new("UICorner",titleBar).CornerRadius=UDim.new(0,10)
+attachDrag(titleBar)
+
+local tt=Instance.new("TextLabel")
+tt.Size=UDim2.new(1,-(CLOSE_SIZE+8),0,TITLE_H)
+tt.BackgroundTransparency=1
+tt.Text="🐸 Froggy.lol"
+tt.TextColor3=Color3.fromRGB(150,255,180)
+tt.Font=Enum.Font.GothamBlack
+tt.TextSize=TITLE_TEXT
+tt.TextXAlignment=Enum.TextXAlignment.Left
+tt.ZIndex=2147483647
+tt.Parent=titleBar
+attachDrag(tt)
+
+local unloadBtn=Instance.new("TextButton")
+unloadBtn.Size=UDim2.new(0,CLOSE_SIZE,0,CLOSE_SIZE)
+unloadBtn.Position=UDim2.new(1,-(CLOSE_SIZE+4),0,math.floor((TITLE_H-CLOSE_SIZE)/2))
+unloadBtn.BackgroundColor3=Color3.fromRGB(120,30,40)
+unloadBtn.BorderSizePixel=0
+unloadBtn.Text="✖"
+unloadBtn.TextColor3=Color3.fromRGB(255,255,255)
+unloadBtn.Font=Enum.Font.GothamBlack
+unloadBtn.TextSize=CLOSE_TEXT
+unloadBtn.ZIndex=2147483647
+unloadBtn.Active=true
+unloadBtn.Parent=titleBar
+Instance.new("UICorner",unloadBtn).CornerRadius=UDim.new(0,4)
+attachDrag(unloadBtn)
+
+local cDragging=false
+local cDragInput=nil
+local cDragStart=nil
+local cDragStartPos=nil
+circleBtn.InputBegan:Connect(function(i)
+    if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+        cDragging=true
+        cDragInput=i
+        cDragStart=i.Position
+        cDragStartPos=circleBtn.Position
+    end
+end)
+U.InputChanged:Connect(function(i)
+    if not cDragging or i~=cDragInput then return end
+    if i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch then
+        local d=i.Position-cDragStart
+        if d.Magnitude>6 then
+            circleBtn.Position=UDim2.new(cDragStartPos.X.Scale,cDragStartPos.X.Offset+d.X,cDragStartPos.Y.Scale,cDragStartPos.Y.Offset+d.Y)
+        end
+    end
+end)
+U.InputEnded:Connect(function(i)
+    if i~=cDragInput then return end
+    local moved=(i.Position-cDragStart).Magnitude
+    cDragging=false
+    cDragInput=nil
+    if moved<(IS_MOBILE and 16 or 10) then
+        mf.Visible=not mf.Visible
+        circleBtn.Text=mf.Visible and "✖" or "🌑"
+        if mf.Visible then task.defer(clampPanel) end
+    end
+end)
+
+local tb=Instance.new("Frame")
+tb.Size=UDim2.new(1,-12,0,TAB_H)
+tb.Position=UDim2.new(0,6,0,TITLE_H+6)
+tb.BackgroundColor3=Color3.fromRGB(20,20,30)
+tb.BorderSizePixel=0
+tb.ZIndex=2147483647
+tb.Active=true
+tb.Parent=mf
+attachDrag(tb)
+Instance.new("UICorner",tb).CornerRadius=UDim.new(0,6)
+local tL=Instance.new("UIListLayout",tb)
+tL.FillDirection=Enum.FillDirection.Horizontal
+tL.Padding=UDim.new(0,3)
+tL.HorizontalAlignment=Enum.HorizontalAlignment.Center
+tL.VerticalAlignment=Enum.VerticalAlignment.Center
+
+local ho=Instance.new("Frame")
+ho.Size=UDim2.new(1,-12,1,-(TITLE_H+TAB_H+16))
+ho.Position=UDim2.new(0,6,0,TITLE_H+TAB_H+10)
+ho.BackgroundTransparency=1
+ho.ZIndex=2147483647
+ho.Active=true
+ho.Parent=mf
+attachDrag(ho)
+
+local pgs={} local tbt={}
+local function show(n)
+    for k,v in pairs(pgs) do v.Visible=(k==n) end
+    for k,v in pairs(tbt) do
+        if k==n then
+            v.BackgroundColor3=Color3.fromRGB(50,200,100)
+            v.TextColor3=Color3.fromRGB(15,15,22)
+        else
+            v.BackgroundColor3=Color3.fromRGB(35,35,45)
+            v.TextColor3=Color3.fromRGB(200,220,200)
+        end
+    end
+end
+local function mk(n,ic)
+    local b=Instance.new("TextButton")
+    b.Size=UDim2.new(0,TAB_BTN_W,1,-4)
+    b.BackgroundColor3=Color3.fromRGB(35,35,45)
+    b.BorderSizePixel=0
+    b.Text=ic
+    b.TextColor3=Color3.fromRGB(200,220,200)
+    b.Font=Enum.Font.GothamBold
+    b.TextSize=TAB_TEXT
+    b.ZIndex=2147483647
+    b.Active=true
+    b.Parent=tb
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,4)
+    b.MouseButton1Click:Connect(function() show(n) end)
+    attachDrag(b)
+    tbt[n]=b
+    local p=Instance.new("Frame")
+    p.Size=UDim2.fromScale(1,1)
+    p.BackgroundTransparency=1
+    p.ZIndex=2147483647
+    p.Active=true
+    p.Parent=ho
+    attachDrag(p)
+    pgs[n]=p
+    return p
+end
+local function mh(p,t)
+    local h=Instance.new("TextLabel")
+    h.Size=UDim2.new(1,0,0,HEADER_H)
+    h.BackgroundTransparency=1
+    h.Text=t
+    h.TextColor3=Color3.fromRGB(120,220,160)
+    h.Font=Enum.Font.GothamBold
+    h.TextSize=HEADER_TEXT
+    h.TextXAlignment=Enum.TextXAlignment.Left
+    h.ZIndex=2147483647
+    h.Parent=p
+    attachDrag(h)
+end
+local function mb(p,t,c)
+    local b=Instance.new("TextButton")
+    b.Size=UDim2.new(1,0,0,TOGGLE_H)
+    b.BackgroundColor3=c or Color3.fromRGB(35,35,45)
+    b.BorderSizePixel=0
+    b.Text=t
+    b.TextColor3=Color3.fromRGB(230,240,230)
+    b.Font=Enum.Font.GothamBold
+    b.TextSize=BTN_TEXT
+    b.ZIndex=2147483647
+    b.Active=true
+    b.Parent=p
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6)
+    attachDrag(b)
+    return b
+end
+local function msc(p)
+    local s=Instance.new("ScrollingFrame")
+    s.Size=UDim2.fromScale(1,1)
+    s.BackgroundTransparency=1
+    s.BorderSizePixel=0
+    s.ScrollBarThickness=3
+    s.ScrollBarImageColor3=Color3.fromRGB(50,200,100)
+    s.AutomaticCanvasSize=Enum.AutomaticSize.Y
+    s.CanvasSize=UDim2.new()
+    s.ZIndex=2147483647
+    s.Active=true
+    s.Parent=p
+    attachDrag(s)
+    local l=Instance.new("UIListLayout",s)
+    l.Padding=UDim.new(0,GAP)
+    return s
+end
+
+local function makeSlider(parent,label,init,max,onChange,minAllowed)
+    minAllowed=minAllowed or 1
+    local box=Instance.new("Frame")
+    box.Size=UDim2.new(1,0,0,SLIDER_BOX_H)
+    box.BackgroundColor3=Color3.fromRGB(35,35,45)
+    box.BorderSizePixel=0
+    box.ZIndex=2147483647
+    box.Active=true
+    box.Parent=parent
+    Instance.new("UICorner",box).CornerRadius=UDim.new(0,6)
+    attachDrag(box)
+    local lbl=Instance.new("TextLabel")
+    lbl.Size=UDim2.new(0.55,-5,0,SLIDER_INPUT_H)
+    lbl.Position=UDim2.new(0,5,0,4)
+    lbl.BackgroundTransparency=1
+    lbl.Text=label..": "
+    lbl.TextColor3=Color3.fromRGB(200,220,200)
+    lbl.Font=Enum.Font.GothamBold
+    lbl.TextSize=SLIDER_LBL
+    lbl.TextXAlignment=Enum.TextXAlignment.Left
+    lbl.ZIndex=2147483647
+    lbl.Parent=box
+    attachDrag(lbl)
+    local input=Instance.new("TextBox")
+    input.Size=UDim2.new(0.4,-5,0,SLIDER_INPUT_H)
+    input.Position=UDim2.new(0.6,0,0,4)
+    input.BackgroundColor3=Color3.fromRGB(20,20,30)
+    input.BorderSizePixel=0
+    input.Text=tostring(init)
+    input.TextColor3=Color3.fromRGB(230,240,230)
+    input.Font=Enum.Font.GothamBold
+    input.TextSize=SLIDER_LBL
+    input.ZIndex=2147483647
+    input.ClearTextOnFocus=false
+    input.Active=true
+    input.Parent=box
+    Instance.new("UICorner",input).CornerRadius=UDim.new(0,4)
+    attachDrag(input)
+    local slider=Instance.new("Frame")
+    slider.Size=UDim2.new(1,-10,0,SLIDER_THICK)
+    slider.Position=UDim2.new(0,5,0,SLIDER_Y)
+    slider.BackgroundColor3=Color3.fromRGB(20,20,30)
+    slider.BorderSizePixel=0
+    slider.ZIndex=2147483647
+    slider.Active=true
+    slider.Parent=box
+    attachDrag(slider)
+    Instance.new("UICorner",slider).CornerRadius=UDim.new(1,0)
+    local fill=Instance.new("Frame")
+    fill.Size=UDim2.new(math.clamp(init/max,0,1),0,1,0)
+    fill.BackgroundColor3=Color3.fromRGB(50,200,100)
+    fill.BorderSizePixel=0
+    fill.ZIndex=2147483647
+    fill.Parent=slider
+    attachDrag(fill)
+    Instance.new("UICorner",fill).CornerRadius=UDim.new(1,0)
+    local drag=false
+    local function setVal(v)
+        v=math.clamp(math.floor(v+0.5),minAllowed,max)
+        fill.Size=UDim2.new(math.clamp(v/max,0,1),0,1,0)
+        input.Text=tostring(v)
+        onChange(v)
+    end
+    local function upd(i)
+        local r=math.clamp((i.Position.X-slider.AbsolutePosition.X)/slider.AbsoluteSize.X,0,1)
+        setVal(r*max)
+    end
+    slider.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+            drag=true
+            upd(i)
+        end
+    end)
+    U.InputChanged:Connect(function(i)
+        if not drag then return end
+        if i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch then
+            upd(i)
+        end
+    end)
+    U.InputEnded:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+            drag=false
+            saveCfg()
+        end
+    end)
+    input.FocusLost:Connect(function()
+        local n=tonumber(input.Text)
+        if n then setVal(n) end
+        saveCfg()
+    end)
+end
+
+local pp=mk("Player","👤") local ps=msc(pp)
+mh(ps,"🚀 Movement")
+local ijBtn=mb(ps,"♾️ Inf Jump: "..(S.infJump and "ON" or "OFF"),S.infJump and Color3.fromRGB(50,200,100) or Color3.fromRGB(60,60,60))
+ijBtn.MouseButton1Click:Connect(function()
+    S.infJump=not S.infJump
+    ijBtn.BackgroundColor3=S.infJump and Color3.fromRGB(50,200,100) or Color3.fromRGB(60,60,60)
+    ijBtn.Text="♾️ Inf Jump: "..(S.infJump and "ON" or "OFF")
+    saveCfg()
+end)
+local ncBtn=mb(ps,"🟣🚪 Noclip: "..(S.noclip and "ON" or "OFF"),S.noclip and Color3.fromRGB(50,200,100) or Color3.fromRGB(60,60,60))
+ncBtn.MouseButton1Click:Connect(function()
+    S.noclip=not S.noclip
+    ncBtn.BackgroundColor3=S.noclip and Color3.fromRGB(50,200,100) or Color3.fromRGB(60,60,60)
+    ncBtn.Text="🟣🚪 Noclip: "..(S.noclip and "ON" or "OFF")
+    saveCfg()
+end)
+local djBtn=mb(ps,"🦘 Inf DJ: "..(S.infDoubleJump and "ON" or "OFF"),S.infDoubleJump and Color3.fromRGB(50,200,100) or Color3.fromRGB(60,60,60))
+djBtn.MouseButton1Click:Connect(function()
+    if S.infDoubleJump then
+        pcall(stopDJ)
+        djBtn.BackgroundColor3=Color3.fromRGB(60,60,60)
+        djBtn.Text="🦘 Inf DJ: OFF"
+    else
+        S.infDoubleJump=true
+        pcall(startDJ)
+        djBtn.BackgroundColor3=Color3.fromRGB(50,200,100)
+        djBtn.Text="🦘 Inf DJ: ON"
+    end
+    saveCfg()
+end)
+local wsBtn=mb(ps,"🏃 WalkSpeed: "..(S.walkSpeed and "ON" or "OFF"),S.walkSpeed and Color3.fromRGB(50,200,100) or Color3.fromRGB(60,60,60))
+wsBtn.MouseButton1Click:Connect(function()
+    S.walkSpeed=not S.walkSpeed
+    wsBtn.BackgroundColor3=S.walkSpeed and Color3.fromRGB(50,200,100) or Color3.fromRGB(60,60,60)
+    wsBtn.Text="🏃 WalkSpeed: "..(S.walkSpeed and "ON" or "OFF")
+    local h=gH()
+    if h then
+        if S.walkSpeed then pcall(function() h.WalkSpeed=S.walkSpeedValue end)
+        else pcall(function() h.WalkSpeed=16 end) end
+    end
+    saveCfg()
+end)
+makeSlider(ps,"Speed",S.walkSpeedValue,250,function(v)
+    S.walkSpeedValue=v
+    if S.walkSpeed then
+        local h=gH()
+        if h then pcall(function() h.WalkSpeed=v end) end
+    end
+end,1)
+local jbBtn=mb(ps,"🦘 Jump Boost: "..(S.jumpBoost and "ON" or "OFF"),S.jumpBoost and Color3.fromRGB(50,200,100) or Color3.fromRGB(60,60,60))
+jbBtn.MouseButton1Click:Connect(function()
+    S.jumpBoost=not S.jumpBoost
+    jbBtn.BackgroundColor3=S.jumpBoost and Color3.fromRGB(50,200,100) or Color3.fromRGB(60,60,60)
+    jbBtn.Text="🦘 Jump Boost: "..(S.jumpBoost and "ON" or "OFF")
+    local h=gH()
+    if h then
+        if S.jumpBoost then pcall(function() h.JumpPower=S.jumpBoostValue end)
+        else pcall(function() h.JumpPower=50 end) end
+    end
+    saveCfg()
+end)
+makeSlider(ps,"Jump Power",S.jumpBoostValue,350,function(v)
+    S.jumpBoostValue=v
+    if S.jumpBoost then
+        local h=gH()
+        if h then pcall(function() h.JumpPower=v end) end
+    end
+end,1)
+mh(ps,"✈️ Fly")
+local flyBtn=mb(ps,"✈️ Fly: "..(S.fly and "ON" or "OFF"),S.fly and Color3.fromRGB(50,200,100) or Color3.fromRGB(60,60,60))
+flyBtn.MouseButton1Click:Connect(function()
+    if S.fly then stopFly() else startFly() end
+    flyBtn.BackgroundColor3=S.fly and Color3.fromRGB(50,200,100) or Color3.fromRGB(60,60,60)
+    flyBtn.Text="✈️ Fly: "..(S.fly and "ON" or "OFF")
+    saveCfg()
+end)
+makeSlider(ps,"Fly Speed",S.flySpeed,500,function(v) S.flySpeed=v end,1)
+
+local cp=mk("Combat","⚔️") local cs=msc(cp)
+mh(cs,"🎯 Silent Aim")
+local aimBtn=mb(cs,"✅ Silent Aim: "..(S.aim and "ON" or "OFF"),S.aim and Color3.fromRGB(50,180,100) or Color3.fromRGB(60,60,60))
+aimBtn.MouseButton1Click:Connect(function()
+    S.aim=not S.aim
+    aimBtn.BackgroundColor3=S.aim and Color3.fromRGB(50,180,100) or Color3.fromRGB(60,60,60)
+    aimBtn.Text="✅ Silent Aim: "..(S.aim and "ON" or "OFF")
+    saveCfg()
+end)
+mh(cs,"Aim Mode")
+local mr=Instance.new("Frame")
+mr.Size=UDim2.new(1,0,0,ROW_H)
+mr.BackgroundTransparency=1
+mr.ZIndex=2147483647
+mr.Active=true
+mr.Parent=cs
+attachDrag(mr)
+local mrL=Instance.new("UIListLayout",mr)
+mrL.FillDirection=Enum.FillDirection.Horizontal
+mrL.Padding=UDim.new(0,3)
+local mbt={}
+for _,mn in ipairs({"Player","NPC"}) do
+    local b=Instance.new("TextButton")
+    b.Size=UDim2.new(0.5,-2,1,0)
+    b.BackgroundColor3=(S.mode==mn) and Color3.fromRGB(50,200,100) or Color3.fromRGB(35,35,45)
+    b.BorderSizePixel=0
+    b.Text=mn
+    b.TextColor3=Color3.fromRGB(230,240,230)
+    b.Font=Enum.Font.GothamBold
+    b.TextSize=BTN_TEXT
+    b.ZIndex=2147483647
+    b.Active=true
+    b.Parent=mr
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,4)
+    b.MouseButton1Click:Connect(function()
+        S.mode=mn
+        for _,o in pairs(mbt) do o.BackgroundColor3=Color3.fromRGB(35,35,45) end
+        b.BackgroundColor3=Color3.fromRGB(50,200,100)
+        saveCfg()
+    end)
+    attachDrag(b)
+    mbt[mn]=b
+end
+makeSlider(cs,"FOV",S.fov,MX,function(v) S.fov=v end,1)
+mh(cs,"Target Part")
+local pr=Instance.new("Frame")
+pr.Size=UDim2.new(1,0,0,ROW_H)
+pr.BackgroundTransparency=1
+pr.ZIndex=2147483647
+pr.Active=true
+pr.Parent=cs
+attachDrag(pr)
+local prL=Instance.new("UIListLayout",pr)
+prL.FillDirection=Enum.FillDirection.Horizontal
+prL.Padding=UDim.new(0,3)
+local pbt={}
+for _,pn in ipairs({"Head","Torso"}) do
+    local b=Instance.new("TextButton")
+    b.Size=UDim2.new(0.5,-2,1,0)
+    b.BackgroundColor3=(S.part==pn) and Color3.fromRGB(50,200,100) or Color3.fromRGB(35,35,45)
+    b.BorderSizePixel=0
+    b.Text=pn
+    b.TextColor3=Color3.fromRGB(230,240,230)
+    b.Font=Enum.Font.GothamBold
+    b.TextSize=BTN_TEXT
+    b.ZIndex=2147483647
+    b.Active=true
+    b.Parent=pr
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,4)
+    b.MouseButton1Click:Connect(function()
+        S.part=pn
+        for _,o in pairs(pbt) do o.BackgroundColor3=Color3.fromRGB(35,35,45) end
+        b.BackgroundColor3=Color3.fromRGB(50,200,100)
+        saveCfg()
+    end)
+    attachDrag(b)
+    pbt[pn]=b
+end
+local sl=Instance.new("TextLabel")
+sl.Size=UDim2.new(1,0,0,TARGET_H)
+sl.BackgroundTransparency=1
+sl.Text="Target: None"
+sl.TextColor3=Color3.fromRGB(150,150,170)
+sl.Font=Enum.Font.Code
+sl.TextSize=IS_MOBILE and 9 or 10
+sl.TextXAlignment=Enum.TextXAlignment.Left
+sl.ZIndex=2147483647
+sl.Parent=cs
+attachDrag(sl)
+mh(cs,"🔥 Fire Rate")
+local frBtn=mb(cs,"🔥 Fire Rate: "..(S.fireRate and "ON" or "OFF"),S.fireRate and Color3.fromRGB(200,100,50) or Color3.fromRGB(60,60,60))
+frBtn.MouseButton1Click:Connect(function()
+    if S.fireRate then
+        pcall(stopFR)
+        frBtn.BackgroundColor3=Color3.fromRGB(60,60,60)
+        frBtn.Text="🔥 Fire Rate: OFF"
+    else
+        S.fireRate=true
+        pcall(startFR)
+        if S.fireRate then
+            frBtn.BackgroundColor3=Color3.fromRGB(200,100,50)
+            frBtn.Text="🔥 Fire Rate: ON"
+        else
+            frBtn.BackgroundColor3=Color3.fromRGB(60,60,60)
+            frBtn.Text="🔥 Fire Rate: OFF"
+        end
+    end
+    saveCfg()
+end)
+makeSlider(cs,"Cooldown (ms)",math.floor(S.fireRateValue*1000+0.5),500,function(v)
+    S.fireRateValue=v/1000
+    if S.fireRate then pcall(frBoostPass) end
+end,1)
+track(U.InputBegan:Connect(function(input,gp)
+    if gp or KILLED then return end
+    if input.UserInputType==Enum.UserInputType.Keyboard and input.KeyCode==Enum.KeyCode.X then
+        S.part=(S.part=="Head") and "Torso" or "Head"
+        for n,btn in pairs(pbt) do
+            btn.BackgroundColor3=(n==S.part) and Color3.fromRGB(50,200,100) or Color3.fromRGB(35,35,45)
+        end
+        saveCfg()
+    end
+end))
+
+local vp=mk("Visuals","🎨") local vs=msc(vp)
+mh(vs,"👁️ Visuals")
+local espBtn=mb(vs,"🔴 ESP: "..(S.esp and "ON" or "OFF"),S.esp and Color3.fromRGB(200,50,80) or Color3.fromRGB(60,60,60))
+espBtn.MouseButton1Click:Connect(function()
+    if S.esp then eoff() else eon() end
+    espBtn.BackgroundColor3=S.esp and Color3.fromRGB(200,50,80) or Color3.fromRGB(60,60,60)
+    espBtn.Text="🔴 ESP: "..(S.esp and "ON" or "OFF")
+    saveCfg()
+end)
+local nameBtn=mb(vs,"📛 Names: "..(S.names and "ON" or "OFF"),S.names and Color3.fromRGB(200,50,80) or Color3.fromRGB(60,60,60))
+nameBtn.MouseButton1Click:Connect(function()
+    if S.names then noff() else non() end
+    nameBtn.BackgroundColor3=S.names and Color3.fromRGB(200,50,80) or Color3.fromRGB(60,60,60)
+    nameBtn.Text="📛 Names: "..(S.names and "ON" or "OFF")
+    saveCfg()
+end)
+local trBtn=mb(vs,"📡 Tracers: "..(S.tracers and "ON" or "OFF"),S.tracers and Color3.fromRGB(200,50,80) or Color3.fromRGB(60,60,60))
+trBtn.MouseButton1Click:Connect(function()
+    S.tracers=not S.tracers
+    trBtn.BackgroundColor3=S.tracers and Color3.fromRGB(200,50,80) or Color3.fromRGB(60,60,60)
+    trBtn.Text="📡 Tracers: "..(S.tracers and "ON" or "OFF")
+    if not S.tracers then for _,l in pairs(lines) do l.Visible=false end end
+    saveCfg()
+end)
+mh(vs,"🎭 Skins")
+local skinBtn=mb(vs,"🎨 Load Skin Changer",Color3.fromRGB(80,60,180))
+skinBtn.MouseButton1Click:Connect(function()
+    local r=loadSkins()
+    if r=="loaded" then
+        skinBtn.Text="✅ Loaded"
+        skinBtn.BackgroundColor3=Color3.fromRGB(50,180,100)
+    elseif r=="already" then
+        skinBtn.Text="✅ Already Loaded"
+    else
+        skinBtn.Text="⚠ "..tostring(r)
+        skinBtn.BackgroundColor3=Color3.fromRGB(200,80,60)
+    end
+end)
+
+local sp2=mk("Settings","⚙️") local ss=msc(sp2)
+mh(ss,"ℹ️ Info")
+mb(ss,"🐸 Froggy.lol — V2 Mobile",Color3.fromRGB(35,35,45))
+show("Player")
+
+-- MAIN AIM LOOP
+task.spawn(function()
+    while not KILLED do
+        if S.aim then
+            local tgt = findTarget()
+            if tgt then
+                S.target = tgt.position
+                sl.Text = "Target: " .. (tgt.model.Name or "?")
+                sl.TextColor3 = Color3.fromRGB(180,255,180)
+            else
+                S.target = nil
+                sl.Text = "Target: None"
+                sl.TextColor3 = Color3.fromRGB(150,150,170)
+            end
+        else
+            S.target = nil
+            sl.Text = "Silent Aim: Disabled"
+            sl.TextColor3 = Color3.fromRGB(255,120,120)
+        end
+        R.Heartbeat:Wait()
+    end
+end)
+
+-- UNLOAD
+local unloading=false
+local function unloadScript()
+    if unloading then return end
+    unloading=true
+    KILLED=true
+    S.aim=false S.target=nil S.walkSpeed=false S.jumpBoost=false
+    S.infJump=false S.noclip=false S.fly=false
+    S.esp=false S.names=false S.tracers=false
+    S.infDoubleJump=false S.fireRate=false
+    pcall(stopDJ) pcall(stopFR) pcall(stopFly) pcall(eoff) pcall(noff)
+    pcall(function()
+        local h=gH()
+        if h then
+            h.PlatformStand=false
+            h.AutoRotate=true
+            pcall(function() h.WalkSpeed=16 end)
+            pcall(function() h.JumpPower=50 end)
+        end
+        local c=LP.Character
+        if c then
+            for _,p in ipairs(c:GetDescendants()) do
+                if p:IsA("BasePart") then p.CanCollide=true end
+            end
+        end
+    end)
+    for _,l in pairs(lines) do pcall(function() l:Remove() end) end
+    lines={}
+    for _,c in ipairs(CONNS) do pcall(function() c:Disconnect() end) end
+    CONNS={}
+    if fovGui then pcall(function() fovGui:Destroy() end) fovGui=nil fovRing=nil end
+    for _,p in ipairs(P:GetPlayers()) do
+        if p.Character then
+            for _,d in ipairs(p.Character:GetDescendants()) do
+                if d.Name=="FroggyESP" or d.Name=="FroggyName" then pcall(function() d:Destroy() end) end
+            end
+        end
+    end
+    mf.Visible=false
+    circleBtn.Visible=false
+    pcall(function() gui:Destroy() end)
+end
+unloadBtn.MouseButton1Click:Connect(unloadScript)
+
+-- POST-INTRO / RESPAWN
+task.spawn(function()
+    task.wait(INTRO_DURATION+0.3)
+    if KILLED then return end
+    if S.esp then eon() end
+    if S.names then non() end
+    if S.infDoubleJump then startDJ() end
+    if S.fireRate then startFR() end
+    if S.fly then
+        local tries=0
+        while not gr() and tries<20 do task.wait(0.2) tries=tries+1 end
+        if gr() then startFly() end
+    end
+end)
+track(LP.CharacterAdded:Connect(function()
+    task.wait(1.0)
+    if KILLED then return end
+    if S.infDoubleJump then CurFighter=nil startDJ() end
+    if S.fireRate then startFR() end
+    if S.fly then
+        S.fly=false
+        local tries=0
+        while not gr() and tries<20 do task.wait(0.2) tries=tries+1 end
+        if gr() then startFly() end
+    end
+end))
